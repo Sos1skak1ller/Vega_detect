@@ -1,0 +1,10 @@
+image,dark_%,objects,scene,output
+8.jpg,63.86279296875001,35,water‑heavy,output/8_out.jpg
+9.jpg,96.116943359375,71,water‑heavy,output/9_out.jpg
+4.jpg,34.649169921875,42,mixed,output/4_out.jpg
+5.jpg,56.611083984375,52,water‑heavy,output/5_out.jpg
+7.jpg,31.347412109375,18,mixed,output/7_out.jpg
+6.jpg,71.386474609375,117,water‑heavy,output/6_out.jpg
+2.jpg,61.423583984375,107,water‑heavy,output/2_out.jpg
+3.jpg,33.716796875,12,mixed,output/3_out.jpg
+1.jpg,68.857421875,124,water‑heavy,output/1_out.jpg
