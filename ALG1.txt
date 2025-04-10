@@ -130,3 +130,81 @@ def process_folder(input_folder: str,
         df = pd.DataFrame(summary)
         df.to_csv(os.path.join(output_folder, "summary.csv"), index=False)
         print(f"CSV summary saved to {output_folder}/summary.csv")
+
+
+from typing import Tuple
+import cv2
+import numpy as np
+from sklearn.cluster import KMeans
+
+def process_sar_image(image_path: str, n_clusters_water: int = 2, n_clusters_land: int = 2) -> np.ndarray:
+    """
+    Обрабатывает SAR-снимок: разделяет объекты на воде и суше, затем кластеризует их по отдельности.
+    
+    :param image_path: путь к bmp-файлу изображения
+    :param n_clusters_water: число кластеров для объектов на воде
+    :param n_clusters_land: число кластеров для объектов на суше
+    :return: изображение с визуализированными кластерами
+    """
+    # Загрузка и преобразование изображения в градации серого
+    sar_img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if sar_img is None:
+        raise ValueError("Изображение не загружено. Проверь путь и формат.")
+
+    # 1. Бинаризация объектов (белые на фоне): ищем яркие объекты
+    _, obj_mask = cv2.threshold(sar_img, 200, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3, 3), np.uint8)
+    obj_mask_clean = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN, kernel)
+
+    # 2. Поиск контуров
+    contours, _ = cv2.findContours(obj_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    features, labels_waterland, centers = [], [], []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = w / h
+        bounding_area = w * h
+        extent = area / bounding_area if bounding_area != 0 else 0
+        compactness = (perimeter ** 2) / area if area != 0 else 0
+        M = cv2.moments(cnt)
+        if M["m00"] != 0:
+            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+        else:
+            cx, cy = x + w // 2, y + h // 2
+        pixel_value = sar_img[cy, cx]
+        location = "land" if pixel_value > 20 else "water"  # эмпирический порог
+        labels_waterland.append(location)
+        centers.append((cx, cy))
+        features.append([area, aspect_ratio, extent, compactness])
+
+    def safe_kmeans(features_subset, n_clusters):
+        if len(features_subset) >= n_clusters:
+            return KMeans(n_clusters=n_clusters, random_state=0).fit(features_subset)
+        return None
+
+    features_land = [f for f, l in zip(features, labels_waterland) if l == "land"]
+    features_water = [f for f, l in zip(features, labels_waterland) if l == "water"]
+    kmeans_land = safe_kmeans(features_land, n_clusters_land)
+    kmeans_water = safe_kmeans(features_water, n_clusters_water)
+
+    output_img = cv2.cvtColor(sar_img, cv2.COLOR_GRAY2BGR)
+    color_land = [(0, 255, 0), (0, 128, 0)]
+    color_water = [(255, 0, 0), (0, 0, 255)]
+
+    for i, (cnt, label, center) in enumerate(zip(contours, labels_waterland, centers)):
+        if label == "land" and kmeans_land:
+            cluster_id = kmeans_land.predict([features[i]])[0]
+            color = color_land[cluster_id % len(color_land)]
+        elif label == "water" and kmeans_water:
+            cluster_id = kmeans_water.predict([features[i]])[0]
+            color = color_water[cluster_id % len(color_water)]
+        else:
+            color = (128, 128, 128)
+        cv2.drawContours(output_img, [cnt], -1, color, 2)
+        cv2.circle(output_img, center, 3, color, -1)
+
+    return output_img
+
