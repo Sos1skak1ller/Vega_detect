@@ -1,0 +1,143 @@
+from __future__ import annotations
+import os
+from typing import Tuple, List
+
+import cv2
+import numpy as np
+import pandas as pd
+from scipy.ndimage import label
+
+def dark_ratio(img: np.ndarray, dark_thresh: int = 40) -> float:
+    return float((img < dark_thresh).sum()) / img.size
+
+def image_dark_percent(image_path: str, dark_thresh: int = 40) -> float:
+    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    return dark_ratio(img, dark_thresh)
+
+def analyse_folder_darkness(folder: str,
+                            dark_thresh: int = 40,
+                            csv_path: str | None = None) -> pd.DataFrame:
+    rows = []
+    for fname in os.listdir(folder):
+        if not fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+            continue
+        pct = image_dark_percent(os.path.join(folder, fname), dark_thresh) * 100
+        rows.append({"image": fname, "dark_%": pct})
+    df = pd.DataFrame(rows).sort_values("dark_%", ascending=False)
+    if csv_path:
+        df.to_csv(csv_path, index=False)
+    return df
+
+def preprocess(img: np.ndarray) -> np.ndarray:
+    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+    img = cv2.convertScaleAbs(img, alpha=1.5, beta=0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(img)
+
+def tune_params(tile: np.ndarray,
+                low: float = 0.40,
+                mid: float = 0.20,
+                area_min_urban: float = 0.001) -> Tuple[float, float]:
+    dr = dark_ratio(tile)
+    if dr > low:
+        return area_min_urban / 5, 1.5
+    if dr > mid:
+        return area_min_urban / 2, 1.8
+    return area_min_urban, 2.2
+
+def detect_objects(tile: np.ndarray,
+                   area_thresh: float,
+                   intensity_ratio: float) -> List[Tuple[int, int, int, int]]:
+    img = preprocess(tile)
+    bin_img = cv2.adaptiveThreshold(img, 255,
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 31, -5)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, k)
+
+    contours, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    objs = []
+    h, w = tile.shape
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < 500:  # оставляем только крупные (будут красными)
+            continue
+
+        aspect = max(bw / bh, bh / bw)
+        if aspect > 15:
+            continue
+
+        compactness = area / (4 * np.pi * ((bw / 2 + bh / 2)**2))
+        if compactness < 0.01:
+            continue
+
+        objs.append((x, y, x + bw, y + bh))
+    return objs
+
+def split_image(image: np.ndarray, max_tile_size=(2000, 2000)):
+    h, w = image.shape
+    if h <= max_tile_size[1] and w <= max_tile_size[0]:
+        return [(image, 0, 0)]
+    tw, th = max_tile_size
+    tiles = []
+    for y in range(0, h, th):
+        for x in range(0, w, tw):
+            tiles.append((image[y:y + th, x:x + tw], x, y))
+    return tiles
+
+def process_image(image_path: str,
+                  max_tile_size=(2000, 2000),
+                  low: float = 0.40,
+                  mid: float = 0.20,
+                  area_min: float = 0.001):
+    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    boxes = []
+    for tile, xo, yo in split_image(img, max_tile_size):
+        area_t, ratio_t = tune_params(tile, low, mid, area_min)
+        for x1, y1, x2, y2 in detect_objects(tile, area_t, ratio_t):
+            boxes.append((x1 + xo, y1 + yo, x2 + xo, y2 + yo))
+    return boxes
+
+def draw_objects(image_path: str, objects, output_path: str):
+    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    for x1, y1, x2, y2 in objects:
+        color = (0, 0, 255)  # только красные рамки
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+    cv2.imwrite(output_path, img)
+
+def process_folder(input_folder: str,
+                   output_folder: str,
+                   max_tile_size=(2000, 2000),
+                   low: float = 0.40,
+                   mid: float = 0.20,
+                   area_min: float = 0.001):
+    os.makedirs(output_folder, exist_ok=True)
+    summary = []
+    for fname in os.listdir(input_folder):
+        if not fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+            continue
+        inp = os.path.join(input_folder, fname)
+        pct_dark = image_dark_percent(inp) * 100
+        if pct_dark > low * 100:
+            scene = "water-heavy"
+        elif pct_dark > mid * 100:
+            scene = "mixed"
+        else:
+            scene = "urban"
+        print(f"{fname}: dark {pct_dark:.1f}% → {scene} params")
+        boxes = process_image(inp, max_tile_size, low, mid, area_min)
+        out_img = os.path.join(output_folder, f"{os.path.splitext(fname)[0]}_out.jpg")
+        draw_objects(inp, boxes, out_img)
+
+        box_df = pd.DataFrame(boxes, columns=['x1', 'y1', 'x2', 'y2'])
+        box_df.to_csv(os.path.join(output_folder, f"{os.path.splitext(fname)[0]}_boxes.csv"), index=False)
+
+        summary.append({"image": fname,
+                        "dark_%": pct_dark,
+                        "objects": len(boxes),
+                        "scene": scene,
+                        "output": out_img})
+    if summary:
+        pd.DataFrame(summary).to_csv(os.path.join(output_folder, "summary.csv"), index=False)
+        print("CSV summary saved → summary.csv")
